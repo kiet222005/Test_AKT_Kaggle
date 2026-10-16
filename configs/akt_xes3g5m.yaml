@@ -7,6 +7,9 @@ paths:
   train_csv: "/kaggle/input/datasets/kiet222005/xes3g5m/XES3G5M/kc_level/train_valid_sequences.csv"
   save_dir: "/kaggle/working/saved_models"
   raw_pred_dir: "/kaggle/working/results/raw_preds"
+  # train_csv: "data/raw/XES3G5M/XES3G5M/kc_level/train_valid_sequences.csv"
+  # save_dir: "saved_models"
+  # raw_pred_dir: "results/raw_preds"
 
 model:
   name: "akt"

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import random
 import time
@@ -13,16 +14,12 @@ import yaml
 
 from src.data import KTTrainDataset
 from src.models import build_model
-from src.registry_logger import ResultsRegistry
 
 
 def parse_args():
   parser = argparse.ArgumentParser(description="Knowledge Tracing Training")
   parser.add_argument(
-      "--config",
-      type=str,
-      required=True,
-      help="Đường dẫn file .yaml (vd: configs/akt_xes3g5m.yaml)",
+      "--config", type=str, required=True, help="Đường dẫn file .yaml"
   )
   return parser.parse_args()
 
@@ -37,12 +34,12 @@ def set_seed(seed: int):
   torch.backends.cudnn.benchmark = False
 
 
-def train_one_epoch(model, loader, optimizer, device, log_every=200):
+def train_one_epoch(model, loader, optimizer, device):
   model.train()
   total_loss, total_samples = 0.0, 0
   t_start = time.time()
 
-  for batch_idx, batch in enumerate(loader):
+  for batch in loader:
     b = {
         k: v.to(device)
         for k, v in batch.items()
@@ -50,14 +47,12 @@ def train_one_epoch(model, loader, optimizer, device, log_every=200):
     }
     optimizer.zero_grad()
 
-    # Model tự dùng b['is_repeat'] để đính kèm Group-Causal Mask
     preds, reg_loss = model(b)
 
     shifted_preds = preds[:, 1:]
     shifted_targets = b["responses"][:, 1:]
     raw_mask = b["select_masks"][:, 1:]
 
-    # Lọc mask hợp lệ
     valid_mask = (raw_mask == 1) & (shifted_targets >= 0)
     valid_preds = shifted_preds[valid_mask]
     valid_targets = shifted_targets[valid_mask].float()
@@ -78,11 +73,6 @@ def train_one_epoch(model, loader, optimizer, device, log_every=200):
     total_loss += loss.item() * n_items
     total_samples += n_items
 
-    if log_every > 0 and (batch_idx + 1) % log_every == 0:
-      print(
-          f"        Batch {batch_idx+1}/{len(loader)} | Loss: {loss.item():.4f}"
-      )
-
   return total_loss / max(total_samples, 1), time.time() - t_start
 
 
@@ -91,7 +81,6 @@ def eval_one_epoch(model, loader, device):
   model.eval()
   total_loss, total_samples = 0.0, 0
   all_preds, all_labels = [], []
-  t_start = time.time()
 
   for batch in loader:
     b = {
@@ -129,12 +118,7 @@ def eval_one_epoch(model, loader, device):
     auc = 0.0
 
   acc = float(accuracy_score(labels_arr, (preds_arr >= 0.5).astype(int)))
-  return {
-      "loss": total_loss / max(total_samples, 1),
-      "auc": auc,
-      "acc": acc,
-      "time": time.time() - t_start,
-  }
+  return {"loss": total_loss / max(total_samples, 1), "auc": auc, "acc": acc}
 
 
 def main():
@@ -150,24 +134,20 @@ def main():
   model_cfg = config["model"]
 
   os.makedirs(paths["save_dir"], exist_ok=True)
-  os.makedirs(paths["raw_pred_dir"], exist_ok=True)
 
-  registry = ResultsRegistry()
   n_folds = train_cfg["n_folds"]
-  fold_results = []
+  model_tag = model_cfg["name"].lower()
+
+  # Lưu vết AUC qua các Epoch của tất cả Folds để vẽ Learning Curve
+  all_folds_history = []
 
   print(f"{'#'*70}\n  TRAINING EXPERIMENT: {config['experiment']['name']}")
   print(f"  MODEL: {model_cfg['name'].upper()} | DEVICE: {device}")
   print(f"{'#'*70}")
 
   for fold_idx in range(n_folds):
-    fold_start = time.time()
     train_folds = [f for f in range(n_folds) if f != fold_idx]
-
-    print(
-        f"\n=== FOLD {fold_idx+1}/{n_folds} (Train: {train_folds} | Val:"
-        f" [{fold_idx}]) ==="
-    )
+    print(f"\n=== FOLD {fold_idx+1}/{n_folds} ===")
 
     train_ds = KTTrainDataset(
         paths["train_csv"], fold_ids=train_folds, max_len=train_cfg["max_len"]
@@ -193,19 +173,20 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=float(train_cfg["lr"]))
 
     best_auc = 0.0
-    best_metrics = None
     patience_counter = 0
+    fold_epoch_aucs = []
 
-    model_tag = model_cfg["name"].lower()
     save_path = os.path.join(
         paths["save_dir"], f"best_{model_tag}_fold{fold_idx}.pt"
     )
 
     for epoch in range(1, train_cfg["epochs"] + 1):
-      train_loss, train_time = train_one_epoch(
-          model, train_loader, optimizer, device, train_cfg.get("log_every", 200)
+      train_loss, t_epoch = train_one_epoch(
+          model, train_loader, optimizer, device
       )
       val_m = eval_one_epoch(model, valid_loader, device)
+
+      fold_epoch_aucs.append(val_m["auc"])
 
       print(
           f"  Epoch {epoch:02d} | Train Loss: {train_loss:.4f} | Val Loss:"
@@ -215,9 +196,6 @@ def main():
 
       if val_m["auc"] > best_auc:
         best_auc = val_m["auc"]
-        best_metrics = dict(val_m)
-        best_metrics["best_epoch"] = epoch
-
         checkpoint = {
             "epoch": epoch,
             "fold": fold_idx,
@@ -234,42 +212,16 @@ def main():
           print(f"  --> Early stopping tại epoch {epoch}")
           break
 
-    fold_time = time.time() - fold_start
-    stopped_epoch = best_metrics["best_epoch"]
+    all_folds_history.append(fold_epoch_aucs)
 
-    # Ghi sổ Registry
-    run_config = dict(config)
-    run_config["config_path"] = args.config
-    run_config["training"]["fold"] = fold_idx
-    run_config["training"]["gpu"] = (
-        torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    )
-
-    registry.log_run(
-        config=run_config,
-        metrics={
-            "val_auc": best_metrics["auc"],
-            "val_acc": best_metrics["acc"],
-            "test_auc": 0.0,
-            "test_acc": 0.0,
-            "test_rmse": 0.0,
-        },
-        stopped_epoch=stopped_epoch,
-        time_per_epoch=fold_time / max(stopped_epoch, 1),
-        raw_pred_path="N/A",
-        author=config["experiment"].get("author", "KietVA_AnhNB"),
-    )
-
-    fold_results.append(best_metrics)
-    del model, optimizer
-    if device.type == "cuda":
-      torch.cuda.empty_cache()
-
-  val_aucs = [f["auc"] for f in fold_results]
-  print(
-      f"\n🏆 5-Fold Mean Val AUC:"
-      f" {np.mean(val_aucs):.4f} ± {np.std(val_aucs, ddof=1):.4f}"
+  # Lưu file history JSON để dùng cho script vẽ biểu đồ
+  history_file = os.path.join(
+      paths["save_dir"], f"history_{model_tag}_val_auc.json"
   )
+  with open(history_file, "w") as f:
+    json.dump(all_folds_history, f)
+
+  print(f"\n✅ Đã hoàn tất Training! Checkpoint & History lưu tại: {paths['save_dir']}")
 
 
 if __name__ == "__main__":
