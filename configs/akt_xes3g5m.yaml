@@ -1,0 +1,36 @@
+experiment:
+  name: "akt_xes3g5m_group_causal"
+  author: "AnhNB_KietVA"
+  tags: ["akt", "xes3g5m", "kc_level"]
+
+paths:
+  train_csv: "/kaggle/input/datasets/kiet222005/xes3g5m/XES3G5M/kc_level/train_valid_sequences.csv"
+  save_dir: "/kaggle/working/saved_models"
+  raw_pred_dir: "/kaggle/working/results/raw_preds"
+
+model:
+  name: "akt"
+  backbone: "Transformer"
+  head: "MLP"
+  n_question: 865
+  n_pid: 7652
+  d_model: 256
+  n_blocks: 1
+  dropout: 0.05
+  d_ff: 256
+  kq_same: 1
+  final_fc_dim: 512
+  num_attn_heads: 8
+  separate_qa: false
+  l2: 0.00001
+  emb_type: "qid"
+
+training:
+  n_folds: 5
+  max_len: 200
+  epochs: 100
+  batch_size: 64
+  lr: 1e-5
+  patience: 3
+  log_every: 200
+  seed: 42
